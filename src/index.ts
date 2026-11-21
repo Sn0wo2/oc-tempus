@@ -1,10 +1,12 @@
 import { Plugin } from "@opencode/plugin"
 import { Goal } from "@opencode/schema/goal"
-import { Job, SessionTime } from "./rpc.ts"
+import { type Job, parseJob, Tempus } from "./rpc.ts"
+import { isRunnable, isSessionIdleTrigger, isTimeTrigger, type Trigger } from "./trigger.ts"
+import { errorMessage } from "./utils/error.ts"
 import { splitFirstToken } from "./utils/text.ts"
 
 export default Plugin.define({
-  id: "oc-session-time",
+  id: "oc-tempus",
   async setup(ctx) {
     const prefix = `jobs/${encodeURIComponent(ctx.location.directory)}/`
     const jobs = new Map<string, Job>()
@@ -12,6 +14,7 @@ export default Plugin.define({
     const parents = new Map<string, string | undefined>()
     const controller = new AbortController()
     const goals = ctx.rpc(Goal.Definition)
+    const watches = new Map<string, () => void>()
     let stopped = false
     let timer: ReturnType<typeof setTimeout> | undefined
     let queue = Promise.resolve()
@@ -28,10 +31,14 @@ export default Plugin.define({
       return result
     }
 
-    async function save(job: Job) {
-      await ctx.storage.set(prefix + job.id, job)
+    const track = (job: Job) => {
       jobs.set(job.id, job)
       if (job.kind === "freeze") frozen.set(job.sessionID, job)
+    }
+
+    const save = async (job: Job) => {
+      await ctx.storage.set(prefix + job.id, job)
+      track(job)
     }
 
     async function remove(job: Job) {
@@ -53,10 +60,13 @@ export default Plugin.define({
 
     async function gate(sessionID: string) {
       const job = await findFreeze(sessionID)
-      if (job)
-        throw new Error(
-          `Session frozen until ${new Date(job.dueAt).toISOString()} (timer ${job.id}). Use /session-time to resume or cancel.`,
-        )
+      if (!job) return
+      const until = isTimeTrigger(job.trigger)
+        ? `until ${new Date(job.trigger.at).toISOString()}`
+        : isSessionIdleTrigger(job.trigger)
+          ? `until session ${job.trigger.sessionID} goes idle`
+          : `until its ${job.trigger.kind} event fires`
+      throw new Error(`Session frozen ${until} (timer ${job.id}). Use /tempus to resume or cancel.`)
     }
 
     async function interruptTree(sessionID: string) {
@@ -72,20 +82,83 @@ export default Plugin.define({
       }
     }
 
-    async function validateCommand(text: string) {
+    type TempusContext = { readonly error: (type: "rejected", message: string) => unknown }
+
+    async function validateCommand(text: string, context: TempusContext) {
       if (!text.startsWith("/")) return
       const [name] = splitFirstToken(text.slice(1))
       const commands = await ctx.command.list({ location: { directory: ctx.location.directory } })
       if (!commands.data.some((command) => command.name === name))
-        throw new Error(`/${name} is not a registered server command. Schedule plain task text instead.`)
+        throw context.error(
+          "rejected",
+          `/${name} is not a registered server command. Schedule plain task text instead.`,
+        )
+    }
+
+    async function plannedSession(sessionID: string) {
+      let after: string | undefined
+      do {
+        const page = await ctx.storage.scan({ prefix: "jobs/", limit: 100, ...(after ? { after } : {}) })
+        for (const entry of page.entries) {
+          let job: Job
+          try {
+            job = parseJob(entry.value)
+          } catch {
+            continue
+          }
+          if (
+            job.kind === "new" &&
+            !job.sessionCreated &&
+            job.sessionID === sessionID &&
+            entry.key.endsWith(`/${job.id}`) &&
+            (job.status === "scheduled" || job.status === "waiting")
+          )
+            return true
+        }
+        after = page.next
+      } while (after)
+      return false
+    }
+
+    async function validateTrigger(trigger: Trigger, context: TempusContext) {
+      if (isTimeTrigger(trigger)) {
+        if (trigger.at <= Date.now()) throw context.error("rejected", "Choose a future time.")
+        return
+      }
+      if (isSessionIdleTrigger(trigger)) {
+        try {
+          await ctx.session.get({ sessionID: trigger.sessionID })
+        } catch (error) {
+          if (!(await plannedSession(trigger.sessionID))) {
+            const detail = errorMessage(error)
+            throw context.error(
+              "rejected",
+              `Session ${trigger.sessionID} does not exist and no pending task will create it${
+                detail ? ` (${detail})` : ""
+              }; schedule the task that creates it first.`,
+            )
+          }
+        }
+        return
+      }
+      throw context.error(
+        "rejected",
+        `Unsupported event kind "${trigger.kind}". This server knows: ${["time", "session.idle"].join(", ")}.`,
+      )
     }
 
     let after: string | undefined
     do {
       const page = await ctx.storage.scan({ prefix, limit: 100, ...(after ? { after } : {}) })
       for (const entry of page.entries) {
-        const job = Job.parse(entry.value)
-        if (entry.key !== prefix + job.id) throw new Error(`Invalid session timer storage key: ${entry.key}`)
+        let job: Job
+        try {
+          job = parseJob(entry.value)
+          if (entry.key !== prefix + job.id) throw new Error(`key does not match job id ${job.id}`)
+        } catch (error) {
+          console.error("oc-tempus: skipping unreadable stored job:", entry.key, errorMessage(error))
+          continue
+        }
         if (job.status === "delivering") {
           await save({
             ...job,
@@ -93,51 +166,77 @@ export default Plugin.define({
             error: "The service stopped during delivery. Check the session, then resume explicitly if needed.",
           })
         } else {
-          jobs.set(job.id, job)
-          if (job.kind === "freeze") frozen.set(job.sessionID, job)
+          track(job)
         }
       }
       after = page.next
     } while (after)
 
-    const hooks = await Promise.all([
-      ctx.session.hook("prompt", (event) => gate(event.sessionID)),
-      ctx.session.hook("model.request", (event) => gate(event.sessionID)),
-      ctx.session.hook("retry", async (event) => {
-        if (await findFreeze(event.sessionID)) event.decision = { retry: false }
-      }),
-    ])
+    function watchSession(sessionID: string) {
+      const abort = new AbortController()
+      let dead = false
+      let retry: ReturnType<typeof setTimeout> | undefined
+      const probe = async () => {
+        try {
+          await ctx.session.wait({ sessionID }, { signal: abort.signal })
+        } catch {
+          if (!(dead || stopped)) retry = setTimeout(() => void probe(), 30_000)
+          return
+        }
+        if (!(dead || stopped)) fire({ kind: "session.idle", sessionID })
+      }
+      void probe()
+      return () => {
+        dead = true
+        clearTimeout(retry)
+        abort.abort()
+      }
+    }
 
     function arm(backoff = 0) {
       clearTimeout(timer)
+      timer = undefined
+      for (const stop of watches.values()) stop()
+      watches.clear()
       if (stopped) return
       let dueAt = Number.POSITIVE_INFINITY
-      for (const job of jobs.values()) if (job.status === "scheduled") dueAt = Math.min(dueAt, job.dueAt)
+      for (const job of jobs.values()) {
+        if (job.status !== "scheduled") continue
+        if (isTimeTrigger(job.trigger)) dueAt = Math.min(dueAt, job.trigger.at)
+        else if (isSessionIdleTrigger(job.trigger)) watches.set(job.id, watchSession(job.trigger.sessionID))
+      }
       if (!Number.isFinite(dueAt)) return
       timer = setTimeout(
-        () => {
-          void exclusive(async () => {
-            for (const job of jobs.values()) {
-              if (job.status !== "scheduled" || job.dueAt > Date.now()) continue
-              await save({ ...job, status: "waiting" })
-              await rpc.events.emit("due", { id: job.id })
-            }
-          }).then(
-            () => arm(),
-            (error: unknown) => {
-              if (!stopped) console.error("oc-session-time:", error)
-              arm(30_000)
-            },
-          )
-        },
+        () => void fire({ kind: "time" }),
         Math.min(2_147_483_647, Math.max(backoff, dueAt - Date.now())),
       )
     }
 
-    const rpc = await ctx.rpc.register(SessionTime, {
-      freeze: (input) =>
+    function fire(wake: { kind: "time" } | { kind: "session.idle"; sessionID: string }) {
+      void exclusive(async () => {
+        for (const job of jobs.values()) {
+          if (job.status !== "scheduled") continue
+          const { trigger } = job
+          const due = isTimeTrigger(trigger)
+            ? trigger.at <= Date.now()
+            : isSessionIdleTrigger(trigger) && wake.kind === "session.idle" && wake.sessionID === trigger.sessionID
+          if (!due) continue
+          await save({ ...job, status: "waiting" })
+          await rpc.events.emit("due", { id: job.id })
+        }
+      }).then(
+        () => arm(),
+        (error) => {
+          if (!stopped) console.error("oc-tempus:", error)
+          arm(30_000)
+        },
+      )
+    }
+
+    const rpc = await ctx.rpc.register(Tempus, {
+      freeze: (input, context) =>
         exclusive(async () => {
-          if (input.dueAt <= Date.now()) throw new Error("Choose a future freeze deadline.")
+          await validateTrigger(input.trigger, context)
           await ctx.session.get({ sessionID: input.sessionID })
           const previous = frozen.get(input.sessionID)
           const goal = await goals.get({ sessionID: input.sessionID })
@@ -147,7 +246,7 @@ export default Plugin.define({
             sessionID: input.sessionID,
             sessionCreated: true,
             goalID: goal?.status === "active" ? goal.id : (previous?.goalID ?? null),
-            dueAt: input.dueAt,
+            trigger: input.trigger,
             createdAt: previous?.createdAt ?? Date.now(),
             text: input.text?.trim() || "The scheduled freeze has ended. Continue the unfinished task in this session.",
             status: "scheduled",
@@ -158,16 +257,16 @@ export default Plugin.define({
           try {
             await interruptTree(job.sessionID)
           } catch (error) {
-            await save({ ...job, status: "failed", error: error instanceof Error ? error.message : String(error) })
+            await save({ ...job, status: "failed", error: errorMessage(error) })
             arm()
             throw error
           }
           return job
         }),
-      schedule: (input) =>
+      schedule: (input, context) =>
         exclusive(async () => {
-          if (input.dueAt <= Date.now()) throw new Error("Choose a future start time.")
-          await validateCommand(input.text)
+          await validateTrigger(input.trigger, context)
+          await validateCommand(input.text, context)
           const id = crypto.randomUUID()
           const job: Job = {
             id,
@@ -175,7 +274,7 @@ export default Plugin.define({
             sessionID: `ses_${id}`,
             sessionCreated: false,
             goalID: null,
-            dueAt: input.dueAt,
+            trigger: input.trigger,
             createdAt: Date.now(),
             text: input.text,
             status: "scheduled",
@@ -185,13 +284,20 @@ export default Plugin.define({
           arm()
           return job
         }),
-      list: () => exclusive(() => Array.from(jobs.values()).sort((left, right) => left.dueAt - right.dueAt)),
-      run: (input) =>
+      list: () =>
+        exclusive(() =>
+          Array.from(jobs.values()).sort(
+            (left, right) =>
+              (isTimeTrigger(left.trigger) ? left.trigger.at : Number.MAX_SAFE_INTEGER) -
+              (isTimeTrigger(right.trigger) ? right.trigger.at : Number.MAX_SAFE_INTEGER),
+          ),
+        ),
+      run: (input, context) =>
         exclusive(async () => {
           let job = jobs.get(input.id)
-          if (!job || (!input.force && (job.dueAt > Date.now() || job.status === "failed"))) return { started: false }
+          if (!(job && (input.force || isRunnable(job, Date.now())))) return { started: false }
           const inherited = job.kind === "freeze" ? await findFreeze(job.sessionID, job.id) : undefined
-          if (inherited) throw new Error(`The parent session is still frozen (timer ${inherited.id}).`)
+          if (inherited) throw context.error("rejected", `The parent session is still frozen (timer ${inherited.id}).`)
           job = { ...job, status: "delivering", error: null }
           await save(job)
           const model = {
@@ -201,7 +307,7 @@ export default Plugin.define({
           }
           try {
             if (job.kind === "new") {
-              await validateCommand(job.text)
+              await validateCommand(job.text, context)
               if (!job.sessionCreated) {
                 await ctx.session.create({
                   id: job.sessionID,
@@ -245,10 +351,10 @@ export default Plugin.define({
             arm()
             return { started: true, sessionID: job.sessionID }
           } catch (error) {
-            await save({ ...job, status: "failed", error: error instanceof Error ? error.message : String(error) })
+            await save({ ...job, status: "failed", error: errorMessage(error) })
             if (job.kind === "freeze") {
-              await interruptTree(job.sessionID).catch((interruption: unknown) => {
-                console.error("oc-session-time:", interruption)
+              await interruptTree(job.sessionID).catch((interruption) => {
+                console.error("oc-tempus:", interruption)
               })
             }
             arm()
@@ -265,15 +371,36 @@ export default Plugin.define({
         }),
     })
 
+    const hooks = await Promise.all([
+      ctx.session.hook("prompt", (event) => gate(event.sessionID)),
+      ctx.session.hook("model.request", (event) => gate(event.sessionID)),
+      ctx.session.hook("retry", async (event) => {
+        if (await findFreeze(event.sessionID)) event.decision = { retry: false }
+      }),
+    ])
+
     void (async () => {
       for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
         try {
           if (event.type === "session.deleted") {
             parents.clear()
             await exclusive(async () => {
-              for (const job of jobs.values()) if (job.sessionID === event.data.sessionID) await remove(job)
+              for (const job of jobs.values()) {
+                if (
+                  job.sessionID !== event.data.sessionID &&
+                  !(isSessionIdleTrigger(job.trigger) && job.trigger.sessionID === event.data.sessionID)
+                )
+                  continue
+                await remove(job)
+              }
               arm()
             })
+          } else if (
+            event.type === "session.execution.succeeded" ||
+            event.type === "session.execution.failed" ||
+            (event.type === "session.execution.interrupted" && event.data.reason !== "shutdown")
+          ) {
+            fire({ kind: "session.idle", sessionID: event.data.sessionID })
           } else if (event.type === "session.execution.started") {
             await exclusive(async () => {
               const job = await findFreeze(event.data.sessionID)
@@ -281,18 +408,18 @@ export default Plugin.define({
             })
           }
         } catch (error) {
-          if (!stopped) console.error("oc-session-time:", error)
+          if (!stopped) console.error("oc-tempus:", error)
         }
       }
-    })().catch((error: unknown) => {
-      if (!controller.signal.aborted) console.error("oc-session-time:", error)
+    })().catch((error) => {
+      if (!controller.signal.aborted) console.error("oc-tempus:", error)
     })
 
     for (const job of frozen.values()) {
       try {
         await interruptTree(job.sessionID)
       } catch (error) {
-        await save({ ...job, status: "failed", error: error instanceof Error ? error.message : String(error) })
+        await save({ ...job, status: "failed", error: errorMessage(error) })
       }
     }
     arm()
@@ -301,6 +428,8 @@ export default Plugin.define({
       stopped = true
       clearTimeout(timer)
       controller.abort()
+      for (const stop of watches.values()) stop()
+      watches.clear()
       await queue
       await Promise.all([rpc.dispose(), ...hooks.map((hook) => hook.dispose())])
     }
