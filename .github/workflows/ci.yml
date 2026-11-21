@@ -66,6 +66,8 @@ jobs:
 
       - run: bun run check
 
+      - run: bun run test
+
       - run: bun run security
 
   autofix:

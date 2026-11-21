@@ -1,20 +1,21 @@
 {
-  "name": "oc-session-time",
+  "name": "oc-tempus",
   "version": "0.0.0",
-  "description": "OpenCode2 plugin that freezes sessions and schedules resuming or new sessions with the current TUI model",
-  "type": "module",
-  "license": "Apache-2.0",
-  "author": "Me0wo",
+  "description": "Freeze OpenCode2 sessions and schedule resuming or new sessions with the current TUI model",
   "keywords": [
     "opencode",
     "opencode2",
     "opencode-plugin",
+    "opencode2-plugin",
     "session",
     "scheduler"
   ],
+  "type": "module",
+  "license": "Apache-2.0",
+  "author": "Me0wo",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Sn0wo2/oc-session-time.git"
+    "url": "git+https://github.com/Sn0wo2/oc-tempus.git"
   },
   "packageManager": "bun@1.4.4",
   "engines": {
@@ -28,12 +29,25 @@
     ".": "./src/index.ts",
     "./tui": "./src/tui.ts"
   },
+  "peerDependencies": {
+    "@opentui/core": ">=0.8.0",
+    "@opentui/solid": ">=0.8.0"
+  },
+  "peerDependenciesMeta": {
+    "@opentui/core": {
+      "optional": true
+    },
+    "@opentui/solid": {
+      "optional": true
+    }
+  },
   "scripts": {
     "lint": "biome check --error-on-warnings .",
     "lint:fix": "biome check --write --error-on-warnings .",
     "check": "tsc --noEmit",
+    "test": "node --test",
     "security": "bun audit --registry=https://registry.npmjs.org",
-    "ci": "bun run lint && bun run check && bun run security",
+    "ci": "bun run lint && bun run check && bun run test && bun run security",
     "release": "goreleaser release --clean",
     "release:dry": "goreleaser release --clean --snapshot"
   },
@@ -41,6 +55,7 @@
     "@opencode/plugin": "2.2.5",
     "@opencode/schema": "2.2.5",
     "solid-js": "^1.9.18",
+    "temporal-polyfill": "^1.0.8",
     "zod": "^4.6.7"
   },
   "overrides": {
@@ -49,6 +64,10 @@
   },
   "devDependencies": {
     "@biomejs/biome": "^2.6.5",
+    "@opencode/client": "2.2.5",
+    "@opencode/theme": "2.2.5",
+    "@opentui/core": "0.9.3",
+    "@opentui/solid": "0.9.3",
     "@types/bun": "^1.4.4",
     "typescript": "^7.0.2"
   }
