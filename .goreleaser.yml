@@ -1,5 +1,5 @@
 version: 2
-project_name: oc-session-time
+project_name: oc-tempus
 
 builds:
   - id: app
